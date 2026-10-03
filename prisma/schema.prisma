@@ -1,0 +1,672 @@
+// Canadian Budgeting PWA — Prisma schema
+// Data model per project spec section 6, plus session and job-queue tables.
+//
+// Amount convention (section 4.6): transaction.amount is signed in the
+// account currency. Negative = money leaving the user's account (outflow).
+// Positive = money entering the user's account (inflow).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum AccountKind {
+  CHEQUING
+  SAVINGS
+  CREDIT_CARD
+  LINE_OF_CREDIT
+  LOAN
+  INVESTMENT
+  CASH
+  DEBT
+  OTHER
+}
+
+enum AccountSource {
+  FLINKS
+  MANUAL
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  REAUTH_REQUIRED
+  ERROR
+  DISCONNECTED
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+enum SyncTrigger {
+  WEBHOOK
+  MANUAL
+  SCHEDULED
+}
+
+enum TransactionType {
+  CREDIT // inflow (amount >= 0)
+  DEBIT // outflow (amount < 0)
+}
+
+enum TransactionStatus {
+  POSTED
+  PENDING
+  REVERSED
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum BudgetPeriod {
+  WEEKLY
+  BIWEEKLY
+  SEMIMONTHLY
+  MONTHLY
+  CUSTOM
+}
+
+enum GoalType {
+  EMERGENCY_FUND
+  VACATION
+  HOME_DOWN_PAYMENT
+  CAR
+  EDUCATION
+  DEBT_PAYOFF
+  OTHER
+}
+
+enum GoalStatus {
+  ACTIVE
+  COMPLETED
+  BEHIND
+  ARCHIVED
+}
+
+enum ContributionSource {
+  MANUAL
+  AUTO_MATCHED
+}
+
+enum PatternKind {
+  INCOME
+  EXPENSE
+}
+
+enum Frequency {
+  WEEKLY
+  BIWEEKLY
+  SEMIMONTHLY
+  MONTHLY
+  QUARTERLY
+  VARIABLE
+}
+
+enum PatternStatus {
+  SUGGESTED
+  CONFIRMED
+  REJECTED
+  DISABLED
+}
+
+enum IncomeKind {
+  PAYROLL
+  PENSION
+  GOVERNMENT_BENEFIT
+  FREELANCE
+  RENT
+  SIDE_INCOME
+  OTHER
+}
+
+enum IncomeStatus {
+  ACTIVE
+  VARIABLE
+  PAUSED
+}
+
+enum NotificationType {
+  CONNECTION_ISSUE
+  SYNC_FAILED
+  NEW_TRANSACTIONS
+  BUDGET_THRESHOLD
+  INCOME_EXPECTED
+  GOAL_MILESTONE
+  GOAL_BEHIND
+  STALE_SYNC
+  SYSTEM
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  DEAD
+}
+
+enum MerchantRuleMatchType {
+  CONTAINS
+  EXACT
+  PREFIX
+  REGEX
+}
+
+// ---------------------------------------------------------------------------
+// Identity & preferences
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  passwordHash  String
+  displayName   String?
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime? // soft delete for data-erasure workflow
+
+  settings          UserSettings?
+  sessions          Session[]
+  connections       ProviderConnection[]
+  accounts          FinancialAccount[]
+  transactions      Transaction[]
+  merchantRules     MerchantRule[]
+  budgets           Budget[]
+  goals             FinancialGoal[]
+  incomeSources     IncomeSource[]
+  recurringPatterns RecurringPattern[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  customCategories  TransactionCategory[]
+
+  @@map("users")
+}
+
+model UserSettings {
+  id                      String    @id @default(cuid())
+  userId                  String    @unique
+  timezone                String    @default("America/Toronto")
+  currency                String    @default("CAD")
+  language                String    @default("en-CA")
+  budgetStartDay          Int       @default(1) // day of month budgets start
+  firstDayOfWeek          Int       @default(0) // 0 = Sunday
+  notifyConnectionIssues  Boolean   @default(true)
+  notifySyncFailures      Boolean   @default(true)
+  notifyNewTransactions   Boolean   @default(true)
+  notifyBudgetThresholds  Boolean   @default(true)
+  notifyIncomeExpected    Boolean   @default(true)
+  notifyGoals             Boolean   @default(true)
+  budgetWarningThreshold  Int       @default(75) // percent
+  budgetCriticalThreshold Int       @default(90)
+  onboardingCompletedAt   DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+model Session {
+  id        String   @id @default(cuid()) // sha256 hash of the raw token
+  userId    String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  userAgent String?
+  ipHash    String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Institutions, connections & accounts
+// ---------------------------------------------------------------------------
+
+model Institution {
+  id           String   @id @default(cuid())
+  provider     String   @default("flinks")
+  providerSlug String   @unique // Flinks institution slug, e.g. "rbc", "td"
+  name         String
+  shortName    String?
+  logoUrl      String?
+  country      String   @default("CA")
+  createdAt    DateTime @default(now())
+
+  connections ProviderConnection[]
+  accounts    FinancialAccount[]
+
+  @@map("institutions")
+}
+
+model ProviderConnection {
+  id                   String           @id @default(cuid())
+  userId               String
+  institutionId        String
+  // Flinks handles. Tokens/secrets are encrypted at rest (AES-256-GCM).
+  flinksRequestId      String?
+  flinksLinkId         String?
+  accessTokenEnc       String?
+  refreshTokenEnc      String?
+  status               ConnectionStatus @default(PENDING)
+  lastSuccessfulSyncAt DateTime?
+  lastSyncStatus       SyncStatus?
+  lastError            String? // sanitized, safe for UI display
+  consentScopes        String[]
+  consentExpiresAt     DateTime?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  disconnectedAt       DateTime?
+
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  institution   Institution          @relation(fields: [institutionId], references: [id])
+  accounts      FinancialAccount[]
+  syncRuns      TransactionSyncRun[]
+  webhookEvents WebhookEvent[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@map("provider_connections")
+}
+
+model FinancialAccount {
+  id                String        @id @default(cuid())
+  userId            String
+  connectionId      String? // null for manual accounts
+  institutionId     String?
+  providerAccountId String? // Flinks account Id, unique per connection
+  source            AccountSource @default(FLINKS)
+  name              String
+  kind              AccountKind
+  subtype           String?
+  currency          String        @default("CAD")
+  currentBalance    Decimal       @default(0) @db.Decimal(14, 2)
+  availableBalance  Decimal?      @db.Decimal(14, 2)
+  creditLimit       Decimal?      @db.Decimal(14, 2)
+  mask              String? // last 4 digits
+  isClosed          Boolean       @default(false)
+  closedAt          DateTime?
+  lastSyncedAt      DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user          User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connection    ProviderConnection?      @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  institution   Institution?             @relation(fields: [institutionId], references: [id])
+  transactions  Transaction[]
+  snapshots     AccountBalanceSnapshot[]
+  goals         FinancialGoal[]
+  incomeSources IncomeSource[]
+
+  @@unique([connectionId, providerAccountId])
+  @@index([userId])
+  @@index([userId, kind])
+  @@map("financial_accounts")
+}
+
+model AccountBalanceSnapshot {
+  id               String   @id @default(cuid())
+  accountId        String
+  balance          Decimal  @db.Decimal(14, 2)
+  availableBalance Decimal? @db.Decimal(14, 2)
+  source           String   @default("SYNC") // SYNC | MANUAL
+  takenAt          DateTime @default(now())
+
+  account FinancialAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, takenAt])
+  @@map("account_balance_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Categories, transactions & rules
+// ---------------------------------------------------------------------------
+
+model TransactionCategory {
+  id        String   @id @default(cuid())
+  key       String   @unique // stable machine key, e.g. "groceries"
+  label     String
+  group     String   @default("EXPENSE") // INCOME | EXPENSE | TRANSFER | SAVINGS
+  color     String   @default("#64748b")
+  icon      String?
+  sortOrder Int      @default(100)
+  isSystem  Boolean  @default(true)
+  userId    String? // set for user-created custom categories
+  createdAt DateTime @default(now())
+
+  user          User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions  Transaction[]
+  budgetItems   BudgetItem[]
+  merchantRules MerchantRule[]
+  patterns      RecurringPattern[]
+
+  @@index([userId])
+  @@map("transaction_categories")
+}
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  userId                String
+  accountId             String
+  categoryId            String?
+  // Provider identity (section 4.6): stable internal reference.
+  providerTransactionId String?
+  fingerprint           String // duplicate-detection hash (account+date+amount+desc)
+  type                  TransactionType
+  status                TransactionStatus @default(POSTED)
+  amount                Decimal           @db.Decimal(14, 2) // signed, account currency
+  currency              String            @default("CAD")
+  date                  DateTime // normalized transaction date
+  postedDate            DateTime?
+  description           String // cleaned display description
+  merchantName          String? // cleaned merchant, after rules
+  rawDescription        String? // original provider description (redacted of acct numbers)
+  isTransfer            Boolean           @default(false)
+  isRefund              Boolean           @default(false)
+  isExcluded            Boolean           @default(false) // excluded from budget math
+  notes                 String?
+  categorization        String            @default("RULE") // RULE | USER | ML | DEFAULT
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account       FinancialAccount     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  category      TransactionCategory? @relation(fields: [categoryId], references: [id])
+  splits        TransactionSplit[]
+  contributions GoalContribution[]
+
+  @@unique([accountId, providerTransactionId])
+  @@index([userId, date])
+  @@index([userId, categoryId])
+  @@index([accountId, date])
+  @@index([userId, fingerprint])
+  @@map("transactions")
+}
+
+model TransactionSplit {
+  id            String  @id @default(cuid())
+  transactionId String
+  categoryId    String
+  amount        Decimal @db.Decimal(14, 2) // signed; splits must sum to parent amount
+  note          String?
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+  @@map("transaction_splits")
+}
+
+model MerchantRule {
+  id           String                @id @default(cuid())
+  userId       String? // null = global rule
+  matchType    MerchantRuleMatchType @default(CONTAINS)
+  pattern      String
+  categoryId   String?
+  merchantName String? // display-name cleanup
+  priority     Int                   @default(100)
+  enabled      Boolean               @default(true)
+  createdAt    DateTime              @default(now())
+
+  user     User?                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category TransactionCategory? @relation(fields: [categoryId], references: [id])
+
+  @@index([userId, priority])
+  @@map("merchant_rules")
+}
+
+model TransactionSyncRun {
+  id                String      @id @default(cuid())
+  connectionId      String
+  trigger           SyncTrigger
+  status            SyncStatus  @default(RUNNING)
+  fetched           Int         @default(0)
+  created           Int         @default(0)
+  updated           Int         @default(0)
+  duplicatesSkipped Int         @default(0)
+  startedAt         DateTime    @default(now())
+  finishedAt        DateTime?
+  error             String?
+
+  connection ProviderConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, startedAt])
+  @@map("transaction_sync_runs")
+}
+
+model WebhookEvent {
+  id           String             @id @default(cuid())
+  provider     String             @default("flinks")
+  eventId      String             @unique // provider event id for idempotency
+  eventType    String
+  connectionId String?
+  payload      Json // redacted raw payload
+  status       WebhookEventStatus @default(RECEIVED)
+  attempts     Int                @default(0)
+  error        String?
+  receivedAt   DateTime           @default(now())
+  processedAt  DateTime?
+
+  connection ProviderConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([receivedAt])
+  @@map("webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// Recurring income & income sources
+// ---------------------------------------------------------------------------
+
+model RecurringPattern {
+  id              String        @id @default(cuid())
+  userId          String
+  kind            PatternKind   @default(INCOME)
+  status          PatternStatus @default(SUGGESTED)
+  categoryId      String?
+  merchantName    String // normalized payor / merchant
+  frequency       Frequency
+  intervalDays    Int? // observed average interval
+  avgAmount       Decimal       @db.Decimal(14, 2)
+  amountMin       Decimal       @db.Decimal(14, 2)
+  amountMax       Decimal       @db.Decimal(14, 2)
+  accountIds      Json // array of account ids seen
+  occurrenceCount Int           @default(0)
+  confidence      Float         @default(0) // 0..1
+  firstSeenAt     DateTime?
+  lastSeenAt      DateTime?
+  nextExpectedAt  DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category       TransactionCategory? @relation(fields: [categoryId], references: [id])
+  incomeSource   IncomeSource?        @relation(fields: [incomeSourceId], references: [id])
+  incomeSourceId String?
+
+  @@index([userId, kind, status])
+  @@map("recurring_patterns")
+}
+
+model IncomeSource {
+  id               String       @id @default(cuid())
+  userId           String
+  patternId        String? // set when derived from a detected pattern
+  name             String
+  kind             IncomeKind   @default(OTHER)
+  status           IncomeStatus @default(ACTIVE)
+  expectedAmount   Decimal      @db.Decimal(14, 2)
+  frequency        Frequency    @default(BIWEEKLY)
+  dayOfWeek        Int? // for weekly/biweekly (0-6)
+  dayOfMonth       Int? // for monthly (1-31)
+  secondDayOfMonth Int? // for semimonthly
+  nextExpectedAt   DateTime?
+  accountId        String?
+  isVariable       Boolean      @default(false)
+  notes            String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  patterns RecurringPattern[]
+  account  FinancialAccount?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@map("income_sources")
+}
+
+// ---------------------------------------------------------------------------
+// Budgets
+// ---------------------------------------------------------------------------
+
+model Budget {
+  id        String       @id @default(cuid())
+  userId    String
+  name      String
+  period    BudgetPeriod @default(MONTHLY)
+  startDate DateTime
+  endDate   DateTime
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  user  User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items BudgetItem[]
+
+  @@index([userId, startDate])
+  @@map("budgets")
+}
+
+model BudgetItem {
+  id         String  @id @default(cuid())
+  budgetId   String
+  categoryId String
+  amount     Decimal @db.Decimal(14, 2) // allocation
+  rollover   Boolean @default(false) // carry-over, later phase
+
+  budget   Budget              @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  category TransactionCategory @relation(fields: [categoryId], references: [id])
+
+  @@unique([budgetId, categoryId])
+  @@index([budgetId])
+  @@map("budget_items")
+}
+
+// ---------------------------------------------------------------------------
+// Goals
+// ---------------------------------------------------------------------------
+
+model FinancialGoal {
+  id                    String     @id @default(cuid())
+  userId                String
+  title                 String
+  type                  GoalType   @default(OTHER)
+  status                GoalStatus @default(ACTIVE)
+  targetAmount          Decimal    @db.Decimal(14, 2)
+  currentAmount         Decimal    @default(0) @db.Decimal(14, 2)
+  targetDate            DateTime?
+  accountId             String? // optional linked savings account
+  contributionFrequency Frequency?
+  notes                 String?
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account       FinancialAccount?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  contributions GoalContribution[]
+
+  @@index([userId, status])
+  @@map("financial_goals")
+}
+
+model GoalContribution {
+  id            String             @id @default(cuid())
+  goalId        String
+  amount        Decimal            @db.Decimal(14, 2)
+  date          DateTime           @default(now())
+  source        ContributionSource @default(MANUAL)
+  transactionId String?
+  note          String?
+
+  goal        FinancialGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  transaction Transaction?  @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([goalId, date])
+  @@map("goal_contributions")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, audit, background jobs
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType @default(SYSTEM)
+  title     String
+  body      String
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String // e.g. "auth.login", "connection.delete"
+  entity    String?
+  entityId  String?
+  metadata  Json?
+  ipHash    String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+model Job {
+  id          String    @id @default(cuid())
+  type        String // e.g. "process_webhook", "sync_connection"
+  payload     Json
+  status      JobStatus @default(PENDING)
+  priority    Int       @default(100) // lower runs first
+  runAfter    DateTime  @default(now())
+  reservedAt  DateTime?
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, runAfter, priority])
+  @@index([type, status])
+  @@map("jobs")
+}
